@@ -5,6 +5,7 @@ from random import randrange
 from tempfile import NamedTemporaryFile
 
 import xmlsig  # pylint: disable=W7936
+from cryptography import x509 as crypto_x509  # pylint: disable=W7936
 from cryptography.hazmat.primitives import serialization  # pylint: disable=W7936
 from cryptography.hazmat.primitives.serialization import pkcs12  # pylint: disable=W7936
 from cryptography.x509 import ExtensionNotFound  # pylint: disable=W7936
@@ -19,24 +20,87 @@ from odoo.tools.translate import _
 
 _logger = logging.getLogger(__name__)
 
+
+def _safe_exc_text(exc):
+    try:
+        return str(exc)
+    except Exception:
+        try:
+            return repr(exc)
+        except Exception:
+            return "<unprintable exception>"
+
+
+# Commands to extract key and certificate from PKCS#12
+# using OpenSSL with legacy support
+# The -legacy flag is required for certificates using
+# older algorithms (e.g., BCE certificates)
 KEY_TO_PEM_CMD = (
-    "openssl pkcs12 -nocerts -in %s -out %s -passin pass:%s -passout pass:%s"
+    "openssl pkcs12 -nocerts -in %s -out %s -legacy -passin pass:%s -passout pass:%s"
+)
+CERT_TO_PEM_CMD = (
+    "openssl pkcs12 -clcerts -nokeys -in %s -out %s -legacy -passin pass:%s"
 )
 
 
 def convert_key_cer_to_pem(key, password):
-    # TODO compute it from a python way
-    with NamedTemporaryFile(
-        "wb", suffix=".key", prefix="edi.ec.tmp."
-    ) as key_file, NamedTemporaryFile(
-        "rb", suffix=".key", prefix="edi.ec.tmp."
-    ) as keypem_file:
-        key_file.write(key)
-        key_file.flush()
-        command = KEY_TO_PEM_CMD % (key_file.name, keypem_file.name, password, password)
+    """
+    Convert PKCS#12 key to PEM format using OpenSSL command.
+
+    This function uses the OpenSSL command-line tool with the -legacy flag
+    to support certificates that use older encryption algorithms (such as
+    those from BCE - Banco Central del Ecuador).
+
+    Args:
+        key: Binary content of the PKCS#12 file
+        password: Password for the PKCS#12 file
+
+    Returns:
+        str: Private key in PEM format
+    """
+    with (
+        NamedTemporaryFile(
+            "wb", suffix=".p12", prefix="edi.ec.tmp.", delete=False
+        ) as p12_file,
+        NamedTemporaryFile(
+            "r", suffix=".pem", prefix="edi.ec.tmp.", delete=False
+        ) as pem_file,
+    ):
+        p12_file.write(key)
+        p12_file.flush()
+        command = KEY_TO_PEM_CMD % (p12_file.name, pem_file.name, password, password)
         subprocess.call(command.split())
-        key_pem = keypem_file.read().decode()
+        pem_file.seek(0)
+        key_pem = pem_file.read()
     return key_pem
+
+
+def convert_cert_to_pem(p12_content, password):
+    """
+    Extract certificate from PKCS#12 to PEM format using OpenSSL command.
+
+    Args:
+        p12_content: Binary content of the PKCS#12 file
+        password: Password for the PKCS#12 file
+
+    Returns:
+        str: Certificate in PEM format
+    """
+    with (
+        NamedTemporaryFile(
+            "wb", suffix=".p12", prefix="edi.ec.tmp.", delete=False
+        ) as p12_file,
+        NamedTemporaryFile(
+            "r", suffix=".pem", prefix="edi.ec.tmp.", delete=False
+        ) as pem_file,
+    ):
+        p12_file.write(p12_content)
+        p12_file.flush()
+        command = CERT_TO_PEM_CMD % (p12_file.name, pem_file.name, password)
+        subprocess.call(command.split())
+        pem_file.seek(0)
+        cert_pem = pem_file.read()
+    return cert_pem
 
 
 class SriKeyType(models.Model):
@@ -65,8 +129,8 @@ class SriKeyType(models.Model):
     # datos informativos del certificado
     issue_date = fields.Date(string="Date of issue", readonly=True)
     expire_date = fields.Date(string="Expiration date", readonly=True)
-    subject_serial_number = fields.Char(string="Serial Number(Subject)", readonly=True)
-    subject_common_name = fields.Char(string="Organization(Subject)", readonly=True)
+    subject_serial_number = fields.Char(string="Serial Number (Subject)", readonly=True)
+    subject_common_name = fields.Char(string="Organization (Subject)", readonly=True)
     issuer_common_name = fields.Char(string="Organization (Issuer)", readonly=True)
     cert_serial_number = fields.Char(
         string="Serial number (certificate)", readonly=True
@@ -74,86 +138,157 @@ class SriKeyType(models.Model):
     cert_version = fields.Char(string="Version", readonly=True)
     days_for_notification = fields.Integer(string="Days for notification", default=30)
 
-    @tools.ormcache("self.file_content", "self.password", "self.state")
+    @tools.ormcache("self.id", "self.write_date", "self.password")
     def _decode_certificate(self):
+        """
+        Decode PKCS#12 certificate and extract private key and certificates.
+
+        This method first attempts to load the certificate using the cryptography
+        library. If that fails (e.g., for certificates using legacy algorithms like
+        those from BCE - Banco Central del Ecuador), it falls back to using OpenSSL
+        with the -legacy flag.
+
+        Returns:
+            tuple: (private_key, certificate, other_certificates)
+
+        Raises:
+            UserError: If the certificate cannot be loaded or is invalid.
+        """
         self.ensure_one()
-        if not self.password:
-            return None, None, None
+        if not self.file_content or not self.password:
+            raise UserError(_("Certificate/password not provided."))
+
         file_content = b64decode(self.file_content)
+        password_bytes = self.password.encode("utf-8")
+        private_key = None
+        cert = None
+        other_certs = None
+
+        # First, try to load using cryptography library (modern certificates)
         try:
-            p12 = pkcs12.load_pkcs12(file_content, self.password.encode())
-        except Exception as ex:
-            _logger.warning(tools.ustr(ex))
-            raise UserError(
-                _(
-                    "Error opening the signature, possibly the signature key has "
-                    "been entered incorrectly or the file is not supported. \n%s"
-                )
-                % (tools.ustr(ex))
-            ) from None
-        certificate = p12.cert.certificate
-        # revisar si el certificado tiene la extension digital_signature activada
-        # caso contrario tomar del listado de certificados el primero que tengan esta
-        # extension
-        is_digital_signature = True
-        try:
-            extension = certificate.extensions.get_extension_for_oid(
-                ExtensionOID.KEY_USAGE
+            private_key, cert, other_certs = pkcs12.load_key_and_certificates(
+                file_content, password_bytes
             )
-            is_digital_signature = extension.value.digital_signature
-        except ExtensionNotFound as ex:
-            _logger.debug(tools.ustr(ex))
-        if not is_digital_signature:
-            # cuando hay mas de un certificado, tomar el certificado correcto
-            # este deberia tener entre las extensiones digital_signature = True
-            # pero si el certificado solo tiene uno, devolvera None
-            for other_cert in p12.additional_certs:
-                try:
-                    extension = other_cert.certificate.extensions.get_extension_for_oid(
-                        ExtensionOID.KEY_USAGE
+        except Exception as ex:
+            _logger.warning(
+                "PKCS#12 load with cryptography failed, trying OpenSSL legacy: %s", ex
+            )
+            try:
+                private_key, cert, other_certs = self._decode_certificate_legacy(
+                    file_content, password_bytes
+                )
+            except Exception as legacy_ex:
+                _logger.error("Both cryptography and OpenSSL legacy load failed")
+                raise UserError(
+                    _(
+                        "Error opening the signature. Wrong password or "
+                        "unsupported file.\n"
+                        "Cryptography error: %(crypto_error)s\n"
+                        "OpenSSL legacy error: %(openssl_error)s"
                     )
-                except ExtensionNotFound as ex:
-                    _logger.debug(tools.ustr(ex))
-                if extension.value.digital_signature:
-                    certificate = other_cert.certificate
+                    % {
+                        "crypto_error": _safe_exc_text(ex),
+                        "openssl_error": _safe_exc_text(legacy_ex),
+                    }
+                ) from None
+
+        if private_key is None or cert is None:
+            raise UserError(
+                _("PKCS#12 does not contain a private key and end-entity certificate.")
+            )
+
+        def has_digital_signature(x509):
+            try:
+                ku = x509.extensions.get_extension_for_oid(ExtensionOID.KEY_USAGE).value
+                return bool(getattr(ku, "digital_signature", False))
+            except ExtensionNotFound:
+                return True
+            except Exception as ex:
+                _logger.warning(
+                    "Skipping key usage check due to malformed extension: %s", ex
+                )
+                return True
+
+        if not has_digital_signature(cert) and other_certs:
+            for other in other_certs:
+                if has_digital_signature(other):
+                    cert = other
                     break
-        private_key_str = convert_key_cer_to_pem(file_content, self.password)
-        start_index = private_key_str.find("Signing Key")
-        # cuando el archivo tiene mas de una firma electronica
-        # viene varias secciones con BEGIN ENCRYPTED PRIVATE KEY
-        # diferenciandose por:
+
+        return (private_key, cert, other_certs or [])
+
+    def _decode_certificate_legacy(self, file_content, password_bytes):
+        """
+        Decode PKCS#12 certificate using OpenSSL command with -legacy flag.
+
+        This method is used as a fallback for certificates that use older
+        encryption algorithms not supported by the cryptography library
+        (e.g., BCE certificates from Banco Central del Ecuador).
+
+        Args:
+            file_content: Binary content of the PKCS#12 file
+            password_bytes: Password as bytes
+
+        Returns:
+            tuple: (private_key, certificate, other_certificates)
+        """
+        password = password_bytes.decode("utf-8")
+
+        # Extract private key using OpenSSL with -legacy flag
+        private_key_str = convert_key_cer_to_pem(file_content, password)
+
+        # When the file has multiple electronic signatures,
+        # it comes with several sections with BEGIN ENCRYPTED PRIVATE KEY
+        # differentiated by:
         # * Decryption Key
         # * Signing Key
-        # asi que tomar desde Signing Key en caso de existir
+        # so take from Signing Key if it exists
+        start_index = private_key_str.find("Signing Key")
         if start_index >= 0:
             private_key_str = private_key_str[start_index:]
+
         start_index = private_key_str.find("-----BEGIN ENCRYPTED PRIVATE KEY-----")
+        if start_index < 0:
+            raise UserError(_("Could not find private key in certificate."))
+
         private_key_str = private_key_str[start_index:]
         private_key = serialization.load_pem_private_key(
             private_key_str.encode(),
-            self.password.encode(),
+            password_bytes,
         )
-        return private_key, certificate
+
+        # Extract certificate using OpenSSL with -legacy flag
+        cert_pem_str = convert_cert_to_pem(file_content, password)
+
+        # Find the certificate in PEM format
+        start_index = cert_pem_str.find("-----BEGIN CERTIFICATE-----")
+        if start_index < 0:
+            raise UserError(_("Could not find certificate in file."))
+
+        cert_pem_str = cert_pem_str[start_index:]
+        cert = crypto_x509.load_pem_x509_certificate(cert_pem_str.encode())
+
+        # For legacy method, we don't extract additional certificates
+        # as they are typically not needed for signing
+        other_certs = []
+
+        return (private_key, cert, other_certs)
 
     def action_validate_and_load(self):
-        _private_key, cert = self._decode_certificate()
+        decoded = self._decode_certificate()
+        cert = decoded[1]
+
         issuer = cert.issuer
         subject = cert.subject
-        subject_common_name = (
-            subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
-            if subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-            else ""
-        )
-        subject_serial_number = (
-            subject.get_attributes_for_oid(NameOID.SERIAL_NUMBER)[0].value
-            if subject.get_attributes_for_oid(NameOID.SERIAL_NUMBER)
-            else ""
-        )
-        issuer_common_name = (
-            issuer.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
-            if subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-            else ""
-        )
+
+        def _attr(name_oid, xname):
+            vals = xname.get_attributes_for_oid(name_oid)
+            return vals[0].value if vals else ""
+
+        subject_common_name = _attr(NameOID.COMMON_NAME, subject)
+        subject_serial_number = _attr(NameOID.SERIAL_NUMBER, subject)
+        issuer_common_name = _attr(NameOID.COMMON_NAME, issuer)
+
         vals = {
             "issue_date": fields.Datetime.context_timestamp(
                 self, cert.not_valid_before
@@ -165,7 +300,7 @@ class SriKeyType(models.Model):
             "subject_serial_number": subject_serial_number,
             "issuer_common_name": issuer_common_name,
             "cert_serial_number": cert.serial_number,
-            "cert_version": cert.version,
+            "cert_version": str(cert.version),  # evita objetos Enum directos
             "state": "valid",
         }
         self.write(vals)
@@ -241,7 +376,13 @@ class SriKeyType(models.Model):
                 [("company_id", "=", company.id), ("state", "=", "valid")]
             )
             for cert in certificates:
-                if 0 < cert.days_to_expire() <= cert.days_for_notification:
+                # sin fecha de vencimiento no hay nada que alertar
+                if not cert.expire_date:
+                    continue
+                # days_to_expire() es negativo cuando el certificado ya vencio:
+                # tambien debe notificarse, si no el certificado vencido queda
+                # en state='valid' para siempre sin avisar a nadie
+                if cert.days_to_expire() <= cert.days_for_notification:
                     email_template.send_mail(
                         cert.id, email_layout_xmlid="mail.mail_notification_light"
                     )
